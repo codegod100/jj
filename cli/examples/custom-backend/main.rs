@@ -96,8 +96,9 @@ fn map_not_found_err(err: std::io::Error, id: &impl ObjectId) -> BackendError {
 
 #[derive(clap::Parser, Clone, Debug)]
 enum CustomCommand {
-    /// Initialize a workspace using the Jit backend
-    InitJit,
+    /// Initialize a workspace using the Custom backend
+    InitCustom,
+    Push,
 }
 fn to_other_err(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> BackendError {
     BackendError::Other(err.into())
@@ -213,31 +214,53 @@ fn commit_from_proto(mut proto: jj_lib::protos::local_store::Commit) -> Commit {
     }
 }
 
-// fn run_custom_command(
-//     _ui: &mut Ui,
-//     command_helper: &CommandHelper,
-//     command: CustomCommand,
-// ) -> Result<(), CommandError> {
-//     match command {
-//         CustomCommand::InitJit => {
-//             let wc_path = command_helper.cwd();
-//             // Initialize a workspace with the custom backend
-//             Workspace::init_with_backend(
-//                 command_helper.settings(),
-//                 wc_path,
-//                 &|settings, store_path| Ok(Box::new(CustomBackend::init(settings, store_path)?)),
-//                 Signer::from_settings(command_helper.settings())
-//                     .map_err(WorkspaceInitError::SignInit)?,
-//             )?;
-//             Ok(())
-//         }
-//     }
-// }
+fn run_custom_command(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    command: CustomCommand,
+) -> Result<(), CommandError> {
+    match command {
+        CustomCommand::InitCustom => {
+            let wc_path = command_helper.cwd();
+            // Initialize a workspace with the custom backend
+            Workspace::init_with_backend(
+                command_helper.settings(),
+                wc_path,
+                &|_settings, store_path| {
+                    println!("{:#?}", store_path);
+                    return Ok(Box::new(CustomBackend::init(store_path)));
+                },
+                Signer::from_settings(command_helper.settings())
+                    .map_err(WorkspaceInitError::SignInit)?,
+            )?;
+            Ok(())
+        }
+        CustomCommand::Push => {
+            let mut workspace_command = command_helper.workspace_helper(ui)?;
+            let store_path = workspace_command.repo_path().join("store");
+            println!("I'm pushing! {:#?}", store_path);
+            let backend = CustomBackend::load(store_path.as_path());
+            println!("backend: {:#?}", backend);
+            Ok(())
+        }
+    }
+}
+fn create_store_factories() -> StoreFactories {
+    let mut store_factories = StoreFactories::empty();
+    // Register the backend so it can be loaded when the repo is loaded. The name
+    // must match `Backend::name()`.
+    store_factories.add_backend(
+        "custom",
+        Box::new(|_settings, store_path| Ok(Box::new(CustomBackend::load(store_path)))),
+    );
+    store_factories
+}
 
 fn main() -> std::process::ExitCode {
+    // tracing_subscriber::fmt::init();
     CliRunner::init()
-        // .add_store_factories(create_store_factories())
-        // .add_subcommand(run_custom_command)
+        .add_store_factories(create_store_factories())
+        .add_subcommand(run_custom_command)
         .run()
 }
 
@@ -291,6 +314,7 @@ impl CustomBackend {
         "custom"
     }
     pub fn load(store_path: &Path) -> Self {
+        println!("loading {:#?}", store_path);
         let root_commit_id = CommitId::from_bytes(&[0; COMMIT_ID_LENGTH]);
         let root_change_id = ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]);
         let empty_tree_id = TreeId::from_hex(
@@ -389,6 +413,7 @@ impl Backend for CustomBackend {
     }
 
     async fn read_file(&self, _path: &RepoPath, id: &FileId) -> BackendResult<Box<dyn Read>> {
+        println!("reading file {:#?}", id);
         let path = self.file_path(id);
         let file = File::open(path).map_err(|err| map_not_found_err(err, id))?;
         Ok(Box::new(zstd::Decoder::new(file).map_err(to_other_err)?))
@@ -489,6 +514,7 @@ impl Backend for CustomBackend {
     }
 
     async fn read_commit(&self, id: &CommitId) -> BackendResult<Commit> {
+        println!("reading commit {:#?}", id);
         if *id == self.root_commit_id {
             return Ok(make_root_commit(
                 self.root_change_id().clone(),
