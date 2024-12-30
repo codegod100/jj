@@ -1949,6 +1949,7 @@ dependencies = [
  "assert_cmd",
  "assert_matches",
  "async-trait",
+ "blake2",
  "bstr",
  "chrono",
  "clap",
@@ -1977,6 +1978,7 @@ dependencies = [
  "pest",
  "pest_derive",
  "pollster",
+ "prost",
  "rayon",
  "regex",
  "rpassword",
@@ -1997,6 +1999,7 @@ dependencies = [
  "tracing-chrome",
  "tracing-subscriber",
  "unicode-width",
+ "zstd",
 ]
 
 [[package]]
