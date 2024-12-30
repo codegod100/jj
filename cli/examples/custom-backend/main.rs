@@ -23,6 +23,8 @@ use std::time::SystemTime;
 use blake2::Blake2b512;
 
 use async_trait::async_trait;
+use blake2::Digest;
+use futures::stream;
 use futures::stream::BoxStream;
 use jj_cli::cli_util::CliRunner;
 use jj_cli::cli_util::CommandHelper;
@@ -39,6 +41,7 @@ use jj_lib::backend::Commit;
 use jj_lib::backend::CommitId;
 use jj_lib::backend::Conflict;
 use jj_lib::backend::ConflictId;
+use jj_lib::backend::ConflictTerm;
 use jj_lib::backend::CopyRecord;
 use jj_lib::backend::FileId;
 use jj_lib::backend::MergedTreeId;
@@ -55,12 +58,14 @@ use jj_lib::content_hash::blake2b_hash;
 use jj_lib::file_util::persist_content_addressed_temp_file;
 use jj_lib::git_backend::GitBackend;
 use jj_lib::index::Index;
+use jj_lib::local_backend::commit_to_proto;
 use jj_lib::merge::MergeBuilder;
 use jj_lib::object_id::ObjectId;
 use jj_lib::protos::local_store::tree::Entry;
 use jj_lib::repo::StoreFactories;
 use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::repo_path::RepoPathComponentBuf;
 use jj_lib::settings::UserSettings;
 use jj_lib::signing::Signer;
 use jj_lib::workspace::Workspace;
@@ -98,6 +103,22 @@ fn to_other_err(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Bac
     BackendError::Other(err.into())
 }
 
+fn conflict_term_to_proto(part: &ConflictTerm) -> jj_lib::protos::local_store::conflict::Term {
+    jj_lib::protos::local_store::conflict::Term {
+        content: Some(tree_value_to_proto(&part.value)),
+    }
+}
+fn conflict_to_proto(conflict: &Conflict) -> jj_lib::protos::local_store::Conflict {
+    let mut proto = jj_lib::protos::local_store::Conflict::default();
+    for term in &conflict.removes {
+        proto.removes.push(conflict_term_to_proto(term));
+    }
+    for term in &conflict.adds {
+        proto.adds.push(conflict_term_to_proto(term));
+    }
+    proto
+}
+
 fn tree_value_to_proto(value: &TreeValue) -> jj_lib::protos::local_store::TreeValue {
     let mut proto = jj_lib::protos::local_store::TreeValue::default();
     match value {
@@ -129,6 +150,15 @@ fn tree_value_to_proto(value: &TreeValue) -> jj_lib::protos::local_store::TreeVa
         }
     }
     proto
+}
+
+fn tree_from_proto(proto: jj_lib::protos::local_store::Tree) -> Tree {
+    let mut tree = Tree::default();
+    for proto_entry in proto.entries {
+        let value = tree_value_from_proto(proto_entry.value.unwrap());
+        tree.set(RepoPathComponentBuf::from(proto_entry.name), value);
+    }
+    tree
 }
 
 fn tree_to_proto(tree: &Tree) -> jj_lib::protos::local_store::Tree {
@@ -218,6 +248,42 @@ struct CustomBackend {
     root_commit_id: CommitId,
     root_change_id: ChangeId,
     empty_tree_id: TreeId,
+}
+fn tree_value_from_proto(proto: jj_lib::protos::local_store::TreeValue) -> TreeValue {
+    match proto.value.unwrap() {
+        jj_lib::protos::local_store::tree_value::Value::TreeId(id) => {
+            TreeValue::Tree(TreeId::new(id))
+        }
+        jj_lib::protos::local_store::tree_value::Value::File(
+            jj_lib::protos::local_store::tree_value::File { id, executable, .. },
+        ) => TreeValue::File {
+            id: FileId::new(id),
+            executable,
+        },
+        jj_lib::protos::local_store::tree_value::Value::SymlinkId(id) => {
+            TreeValue::Symlink(SymlinkId::new(id))
+        }
+        jj_lib::protos::local_store::tree_value::Value::ConflictId(id) => {
+            TreeValue::Conflict(ConflictId::new(id))
+        }
+    }
+}
+
+fn conflict_term_from_proto(proto: jj_lib::protos::local_store::conflict::Term) -> ConflictTerm {
+    ConflictTerm {
+        value: tree_value_from_proto(proto.content.unwrap()),
+    }
+}
+
+fn conflict_from_proto(proto: jj_lib::protos::local_store::Conflict) -> Conflict {
+    let mut conflict = Conflict::default();
+    for term in proto.removes {
+        conflict.removes.push(conflict_term_from_proto(term));
+    }
+    for term in proto.adds {
+        conflict.adds.push(conflict_term_from_proto(term));
+    }
+    conflict
 }
 
 impl CustomBackend {
@@ -402,7 +468,7 @@ impl Backend for CustomBackend {
         let path = self.conflict_path(id);
         let buf = fs::read(path).map_err(|err| map_not_found_err(err, id))?;
 
-        let proto = crate::protos::local_store::Conflict::decode(&*buf).map_err(to_other_err)?;
+        let proto = jj_lib::protos::local_store::Conflict::decode(&*buf).map_err(to_other_err)?;
         Ok(conflict_from_proto(proto))
     }
 
