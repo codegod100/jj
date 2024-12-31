@@ -26,3 +26,5 @@ jj-trace-*.json
 
 # To make working on buck2 easier (#1997, #4413)
 /buck-out/
+
+/store*

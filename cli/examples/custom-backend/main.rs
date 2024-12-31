@@ -24,6 +24,8 @@ use blake2::Blake2b512;
 
 use async_trait::async_trait;
 use blake2::Digest;
+use clap::command;
+use clap::ArgGroup;
 use futures::stream;
 use futures::stream::BoxStream;
 use jj_cli::cli_util::CliRunner;
@@ -62,6 +64,7 @@ use jj_lib::local_backend::commit_to_proto;
 use jj_lib::merge::MergeBuilder;
 use jj_lib::object_id::ObjectId;
 use jj_lib::protos::local_store::tree::Entry;
+use jj_lib::repo::Repo;
 use jj_lib::repo::StoreFactories;
 use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
@@ -98,7 +101,7 @@ fn map_not_found_err(err: std::io::Error, id: &impl ObjectId) -> BackendError {
 enum CustomCommand {
     /// Initialize a workspace using the Custom backend
     InitCustom,
-    Push,
+    Push(PushArgs),
 }
 fn to_other_err(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> BackendError {
     BackendError::Other(err.into())
@@ -214,6 +217,11 @@ fn commit_from_proto(mut proto: jj_lib::protos::local_store::Commit) -> Commit {
     }
 }
 
+#[derive(clap::Args, Clone, Debug)]
+pub struct PushArgs {
+    remote: String,
+}
+
 fn run_custom_command(
     ui: &mut Ui,
     command_helper: &CommandHelper,
@@ -235,12 +243,87 @@ fn run_custom_command(
             )?;
             Ok(())
         }
-        CustomCommand::Push => {
-            let mut workspace_command = command_helper.workspace_helper(ui)?;
-            let store_path = workspace_command.repo_path().join("store");
-            println!("I'm pushing! {:#?}", store_path);
-            let backend = CustomBackend::load(store_path.as_path());
-            println!("backend: {:#?}", backend);
+        CustomCommand::Push(args) => {
+            println!("args: {:#?}", args);
+            let workspace_command = command_helper.workspace_helper(ui)?;
+            let remote_path = PathBuf::from(args.remote)
+                .join(".jj")
+                .join("repo")
+                .join("store");
+            let remote = CustomBackend::load(remote_path.as_path());
+            println!("remote: {:#?}", remote);
+            let store = workspace_command.repo().store();
+            let backend = store
+                .backend_impl()
+                .downcast_ref::<CustomBackend>()
+                .unwrap();
+            let view = workspace_command.repo().view();
+            // let commits = view.wc_commit_ids();
+            let commit_ids = view.all_referenced_commit_ids();
+            // println!("commits: {:#?}", commits);
+            // let backend = store.backend;
+            // workspace_command.path_converter()
+            for commit_id in commit_ids {
+                let commit = backend.read_commit(&commit_id).block_on().unwrap();
+                remote
+                    .write_commit(commit.clone(), None)
+                    .block_on()
+                    .unwrap();
+                let root_tree = commit.root_tree.clone();
+                println!("root tree: {:#?}", root_tree);
+                if let MergedTreeId::Merge(tree_id) = root_tree {
+                    // let repo_path_str: &Path = workspace_command.repo_path()
+                    // println!("repo path string: {:#?}", repo_path_str);
+                    // let repo_path = RepoPath::from_internal_string(&repo_path_str);
+                    // println!("repo path: {:#?}", repo_path);
+                    // let repo_path = workspace_command.repo_path().to_relative_path().unwrap();
+                    // workspace_command.
+                    // let rpb =
+                    //     RepoPathBuf::from_relative_path(workspace_command.repo_path()).unwrap();
+                    let tree = backend
+                        .read_tree(RepoPath::root(), &tree_id.as_resolved().unwrap())
+                        .block_on()
+                        .unwrap();
+                    println!("Tree: {:#?}", tree);
+                    let entries = tree.entries();
+                    for entry in entries {
+                        println!("entry: {:#?}", entry);
+                        let value = entry.value();
+                        match value {
+                            TreeValue::File { id, .. } => {
+                                let mut file =
+                                    backend.read_file(RepoPath::root(), &id).block_on().unwrap();
+                                // println!("file: {:#?}", file);
+                                let mut buffer = Vec::new();
+                                file.read_to_end(&mut buffer).unwrap();
+                                let contents = String::from_utf8_lossy(&buffer);
+                                println!("contents: {}", contents);
+
+                                remote
+                                    .write_file(RepoPath::root(), &mut buffer.as_slice())
+                                    .block_on()
+                                    .unwrap();
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    remote
+                        .write_tree(RepoPath::root(), &tree)
+                        .block_on()
+                        .unwrap();
+                }
+                println!("commit_id: {:#?}", commit_id);
+                println!("commit: {:#?}", commit);
+            }
+            for (name, targets) in view.local_remote_bookmarks("foo") {
+                // println!("name: {:#?}, targets: {:#?}", name, targets);
+            }
+            // println!("bookmarks: {:#?}", bookmarks);
+            // println!("I'm pushing! {:#?}", store_path);
+            // let backend = CustomBackend::load(store_path.as_path());
+            // println!("backend: {:#?}", backend);
+            println!("store: {:#?}", store);
             Ok(())
         }
     }
@@ -264,7 +347,7 @@ fn main() -> std::process::ExitCode {
         .run()
 }
 
-/// A commit backend that's extremely similar to the Git backend
+/// A commit backend that's similiar to LocalBackend
 #[derive(Debug)]
 struct CustomBackend {
     path: PathBuf,
@@ -534,6 +617,7 @@ impl Backend for CustomBackend {
         mut commit: Commit,
         sign_with: Option<&mut SigningFn>,
     ) -> BackendResult<(CommitId, Commit)> {
+        println!("writing commit");
         assert!(commit.secure_sig.is_none(), "commit.secure_sig was set");
 
         if commit.parents.is_empty() {
@@ -541,8 +625,9 @@ impl Backend for CustomBackend {
                 "Cannot write a commit with no parents".into(),
             ));
         }
+        println!("creating temp file");
         let temp_file = NamedTempFile::new_in(&self.path).map_err(to_other_err)?;
-
+        println!("new file: {:#?}", temp_file.path());
         let mut proto = commit_to_proto(&commit);
         if let Some(sign) = sign_with {
             let data = proto.encode_to_vec();
